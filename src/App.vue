@@ -14,6 +14,7 @@ import {
   SwapIcon
 } from 'tdesign-icons-vue-next';
 import TokenEditor from './components/TokenEditor.vue';
+import ReconcileView from './components/ReconcileView.vue';
 import { fetchTokens, submitRelease, type Token } from './api';
 import { useTokenStore } from './store';
 
@@ -42,7 +43,8 @@ const nav = [
   { path: '/', label: '令牌工作区', icon: 'token' },
   { path: '/graph', label: '依赖与校验', icon: 'control-platform' },
   { path: '/review', label: '变更评审', icon: 'git-commit' },
-  { path: '/publish', label: '主题发布', icon: 'send' }
+  { path: '/publish', label: '主题发布', icon: 'send' },
+  { path: '/reconcile', label: '发布对账', icon: 'swap' }
 ];
 
 const pageTitle = computed(() => nav.find((item) => item.path === route.path)?.label ?? '令牌工作区');
@@ -226,6 +228,10 @@ function publish() {
               <div class="change-actions"><t-button variant="outline" :disabled="change.status !== '待评审'" @click="store.rejectChange(change.id)">退回并说明</t-button><t-button theme="primary" :disabled="change.status !== '待评审'" @click="store.acceptChange(change.id)">接受变更</t-button></div>
             </div>
           </div>
+        </section>
+
+        <section v-else-if="route.path === '/reconcile'">
+          <ReconcileView />
         </section>
 
         <section v-else class="publish-page">

@@ -61,3 +61,23 @@ export async function submitRelease(payload: { version: string; accepted: string
   await new Promise((resolve) => setTimeout(resolve, 220));
   return { accepted: true, releaseId: `DS-${payload.version}-${Date.now().toString().slice(-4)}` };
 }
+
+// ── 发布批次通道 ──────────────────────────────────────────
+
+/**
+ * 模拟向产品通道写入发布内容。
+ * simulateFailure=true 时按概率失败，用于演示写入中断后保留批次、立即重试。
+ */
+export async function sendChannelApi(
+  batchNo: string,
+  channelNo: string,
+  contentHash: string,
+  simulateFailure: boolean
+): Promise<{ success: boolean; seq: number; error?: string }> {
+  await new Promise((resolve) => setTimeout(resolve, 180));
+  const shouldFail = simulateFailure && Math.random() < 0.4;
+  if (shouldFail) {
+    return { success: false, seq: 0, error: `通道 ${channelNo} 写入超时（模拟网络波动）` };
+  }
+  return { success: true, seq: 1 };
+}

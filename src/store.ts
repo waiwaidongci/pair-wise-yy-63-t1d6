@@ -1,4 +1,13 @@
 import { defineStore } from 'pinia';
+import {
+  freezeSnapshot,
+  nextBatchNo,
+  mergeReceipt,
+  recalculateBatch,
+  isBaseToken,
+  type ReleaseBatch
+} from './reconcile';
+import { sendChannelApi } from './api';
 
 export type TokenCategory = 'color' | 'font' | 'spacing' | 'radius' | 'shadow' | 'component';
 export type Token = {
@@ -62,7 +71,9 @@ export const useTokenStore = defineStore('tokens', {
     releaseVersion: '4.6.0-rc.2',
     locked: (saved?.locked as boolean) ?? false,
     lastPublished: (saved?.lastPublished as string) ?? 'DS 4.5.2',
-    baseline: initialTokens.map((token) => ({ id: token.id, value: token.value }))
+    baseline: initialTokens.map((token) => ({ id: token.id, value: token.value })),
+    batches: (saved?.batches as ReleaseBatch[]) ?? [],
+    simulateFailure: false
   }),
   getters: {
     selectedToken(state): Token | undefined {
@@ -118,6 +129,15 @@ export const useTokenStore = defineStore('tokens', {
     releaseReadiness(state): number {
       const base = 100 - this.cycleNodes.length * 25 - this.invalidReferences.length * 20 - this.contrastIssues.length * 15;
       return Math.max(0, base);
+    },
+    openBatches(state): ReleaseBatch[] {
+      return state.batches.filter((b) => b.status === 'open');
+    },
+    pendingReviewCount(state): number {
+      return state.batches.reduce((sum, b) => sum + b.reviewItems.filter((r) => r.status === 'pending').length, 0);
+    },
+    failedChannelCount(state): number {
+      return state.batches.reduce((sum, b) => sum + b.channels.filter((c) => c.status === 'failed').length, 0);
     }
   },
   actions: {
@@ -128,10 +148,15 @@ export const useTokenStore = defineStore('tokens', {
     updateTokenValue(id: string, value: string) {
       const token = this.tokens.find((item) => item.id === id);
       if (!token) return;
+      const wasBase = isBaseToken(id, this.tokens);
       token.value = value;
       token.themes[this.activeTheme] = value;
       if (value.startsWith('{') && value.endsWith('}')) token.ref = value.slice(1, -1);
       else delete token.ref;
+      // 基础令牌修改后，未闭合批次立即失效重算
+      if (wasBase) {
+        this.invalidateOpenBatches(`基础令牌 ${id} 已修改`);
+      }
       this.persist();
     },
     addToken(token: Token) {
@@ -171,8 +196,120 @@ export const useTokenStore = defineStore('tokens', {
       }
       this.persist();
     },
+    // ── 发布批次 ──────────────────────────────────────────
+    createBatch(version: string, products: string[]) {
+      const snapshot = freezeSnapshot(this.tokens);
+      const batchNo = nextBatchNo(this.batches);
+      const channels = products.map((product, index) => ({
+        channelNo: `CH${String(index + 1).padStart(3, '0')}`,
+        product,
+        status: 'pending' as const,
+        seq: 0,
+        contentHash: '',
+        retryCount: 0
+      }));
+      const batch: ReleaseBatch = {
+        batchNo,
+        version,
+        status: 'open',
+        createdAt: new Date().toISOString(),
+        snapshot,
+        originalSnapshot: snapshot,
+        channels,
+        receipts: [],
+        reviewItems: [],
+        reissueDiffs: []
+      };
+      this.batches.push(batch);
+      this.persist();
+      return batchNo;
+    },
+    async sendChannel(batchNo: string, channelNo: string) {
+      const batch = this.batches.find((b) => b.batchNo === batchNo);
+      if (!batch) return;
+      const channel = batch.channels.find((c) => c.channelNo === channelNo);
+      if (!channel || channel.status === 'confirmed') return;
+      channel.seq += 1;
+      try {
+        const result = await sendChannelApi(batchNo, channelNo, batch.snapshot.contentHash, this.simulateFailure);
+        if (result.success) {
+          channel.status = 'sent';
+          channel.contentHash = batch.snapshot.contentHash;
+          channel.sentAt = new Date().toISOString();
+          channel.lastError = undefined;
+        } else {
+          channel.status = 'failed';
+          channel.lastError = result.error ?? '写入失败';
+          channel.retryCount += 1;
+        }
+      } catch (err) {
+        channel.status = 'failed';
+        channel.lastError = err instanceof Error ? err.message : '写入异常';
+        channel.retryCount += 1;
+      }
+      this.persist();
+    },
+    async retryFailedChannels(batchNo: string) {
+      const batch = this.batches.find((b) => b.batchNo === batchNo);
+      if (!batch) return;
+      const pending = batch.channels.filter((c) => c.status === 'failed' || c.status === 'pending');
+      for (const channel of pending) {
+        await this.sendChannel(batchNo, channel.channelNo);
+      }
+    },
+    submitReceipt(batchNo: string, channelNo: string, seq: number, contentHash: string, raw: string) {
+      const batch = this.batches.find((b) => b.batchNo === batchNo);
+      if (!batch) return { result: 'duplicate' as const };
+      const { batch: updated, result } = mergeReceipt(batch, {
+        batchNo,
+        channelNo,
+        seq,
+        contentHash,
+        raw
+      });
+      const index = this.batches.findIndex((b) => b.batchNo === batchNo);
+      if (index >= 0) this.batches[index] = updated;
+      this.persist();
+      return { result };
+    },
+    resolveReview(batchNo: string, reviewId: string, resolution: 'confirmed' | 'rejected') {
+      const batch = this.batches.find((b) => b.batchNo === batchNo);
+      if (!batch) return;
+      const review = batch.reviewItems.find((r) => r.id === reviewId);
+      if (!review) return;
+      review.status = 'resolved';
+      review.resolution = resolution === 'confirmed' ? '确认首次回执有效' : '驳回并重新发送';
+      if (resolution === 'confirmed') {
+        const channel = batch.channels.find((c) => c.channelNo === review.channelNo);
+        if (channel) {
+          channel.status = 'confirmed';
+          channel.confirmedAt = new Date().toISOString();
+          channel.contentHash = review.firstReceipt.contentHash;
+        }
+        if (batch.channels.every((c) => c.status === 'confirmed')) {
+          batch.status = 'closed';
+          batch.closedAt = new Date().toISOString();
+        }
+      } else {
+        const channel = batch.channels.find((c) => c.channelNo === review.channelNo);
+        if (channel) channel.status = 'failed';
+      }
+      this.persist();
+    },
+    invalidateOpenBatches(reason: string) {
+      this.batches.forEach((batch) => {
+        if (batch.status === 'open') {
+          const recalculated = recalculateBatch(batch, this.tokens, reason);
+          const index = this.batches.findIndex((b) => b.batchNo === batch.batchNo);
+          if (index >= 0) this.batches[index] = recalculated;
+        }
+      });
+    },
+    setSimulateFailure(value: boolean) {
+      this.simulateFailure = value;
+    },
     persist() {
-      if (typeof localStorage !== 'undefined') localStorage.setItem(storageKey, JSON.stringify({ tokens: this.tokens, changes: this.changes, activeTheme: this.activeTheme, selectedTokenId: this.selectedTokenId, search: this.search, category: this.category, locked: this.locked, lastPublished: this.lastPublished }));
+      if (typeof localStorage !== 'undefined') localStorage.setItem(storageKey, JSON.stringify({ tokens: this.tokens, changes: this.changes, activeTheme: this.activeTheme, selectedTokenId: this.selectedTokenId, search: this.search, category: this.category, locked: this.locked, lastPublished: this.lastPublished, batches: this.batches }));
     }
   }
 });
