@@ -1,26 +1,25 @@
 <script setup lang="ts">
 import { computed, h, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { useQuery, useMutation } from '@tanstack/vue-query';
+import { useQuery } from '@tanstack/vue-query';
 import { MessagePlugin } from 'tdesign-vue-next';
 import {
   AddIcon,
   ArrowRightIcon,
   CopyIcon,
-  HistoryIcon,
   LockOnIcon,
   RefreshIcon,
   SearchIcon,
   SwapIcon
 } from 'tdesign-icons-vue-next';
 import TokenEditor from './components/TokenEditor.vue';
-import { fetchTokens, submitRelease, type Token } from './api';
+import PublishReconcile from './components/PublishReconcile.vue';
+import { fetchTokens, type Token } from './api';
 import { useTokenStore } from './store';
 
 const AddButtonIcon = () => h(AddIcon);
 const ArrowRightButtonIcon = () => h(ArrowRightIcon);
 const CopyButtonIcon = () => h(CopyIcon);
-const HistoryButtonIcon = () => h(HistoryIcon);
 const LockButtonIcon = () => h(LockOnIcon);
 const RefreshButtonIcon = () => h(RefreshIcon);
 const SearchInputIcon = () => h(SearchIcon);
@@ -30,13 +29,10 @@ const route = useRoute();
 const router = useRouter();
 const store = useTokenStore();
 const { data: remote } = useQuery({ queryKey: ['tokens'], queryFn: fetchTokens });
-const selectedVersion = ref(store.releaseVersion);
 const batchFrom = ref('');
 const batchTo = ref('');
-const releaseDialog = ref(false);
 const newTokenDialog = ref(false);
 const newToken = ref({ id: '', name: '', category: 'color', value: '#2864dc', description: '' });
-const releaseResult = ref('');
 
 const nav = [
   { path: '/', label: '令牌工作区', icon: 'token' },
@@ -72,14 +68,6 @@ const graphEdges = computed(() => store.dependencyEdges.map((edge) => {
   const to = graphNodes.value.find((node) => node.id === edge.to);
   return from && to ? { ...edge, from, to } : null;
 }).filter(Boolean) as { from: Token & {x:number;y:number}; to: Token & {x:number;y:number} }[]);
-
-const releaseMutation = useMutation({
-  mutationFn: (payload: { version: string; accepted: string[]; actor: string }) => submitRelease(payload),
-  onSuccess: (data) => {
-    releaseResult.value = `发布标识 ${data.releaseId} · ${new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`;
-    MessagePlugin.success('主题版本已锁定并生成发布记录');
-  }
-});
 
 watch(remote, (value) => {
   if (value && !store.tokens.length) value.tokens.forEach((token) => store.addToken(token));
@@ -121,28 +109,25 @@ function addToken() {
 
 function batchReplace() {
   if (!batchFrom.value || !batchTo.value) return;
+  const changedBaseIds: string[] = [];
   let count = 0;
   store.tokens.forEach((token) => {
+    const touched = token.value === batchFrom.value;
     Object.keys(token.themes).forEach((theme) => {
       if (token.themes[theme] === batchFrom.value) {
         token.themes[theme] = batchTo.value;
         count += 1;
       }
     });
-    if (token.value === batchFrom.value) {
+    if (touched) {
       token.value = batchTo.value;
       count += 1;
+      if (!token.ref) changedBaseIds.push(token.id);
     }
   });
+  if (changedBaseIds.length) store.invalidateOpenBatches(`批量替换基础值 ${batchFrom.value} → ${batchTo.value}（${count} 处）`, changedBaseIds);
   store.persist();
   MessagePlugin.success(`已替换 ${count} 处引用`);
-}
-
-function publish() {
-  const accepted = store.changes.filter((item) => item.status === '已接受').map((item) => item.id);
-  releaseMutation.mutate({ version: selectedVersion.value, accepted, actor: '设计系统维护员' });
-  store.lockRelease();
-  releaseDialog.value = true;
 }
 </script>
 
@@ -164,7 +149,7 @@ function publish() {
       <t-content class="main-content">
         <header class="page-heading">
           <div><small>{{ store.locked ? 'RELEASE LOCKED' : 'GOVERNANCE WORKBENCH' }} / {{ pageTitle }}</small><h1>{{ pageTitle }}</h1><p>基础令牌到语义令牌的引用、差异、校验与跨主题发布。</p></div>
-          <div class="heading-actions"><t-select v-model="store.activeTheme" style="width: 150px" :options="[{label:'明亮模式',value:'light'},{label:'暗色模式',value:'dark'},{label:'运营模式',value:'ops'},{label:'高对比度',value:'contrast'}]" /><t-button variant="outline" :icon="AddButtonIcon" @click="newTokenDialog = true">新建令牌</t-button><t-button theme="primary" :icon="LockButtonIcon" :disabled="store.locked" @click="publish">发布主题</t-button></div>
+          <div class="heading-actions"><t-select v-model="store.activeTheme" style="width: 150px" :options="[{label:'明亮模式',value:'light'},{label:'暗色模式',value:'dark'},{label:'运营模式',value:'ops'},{label:'高对比度',value:'contrast'}]" /><t-button variant="outline" :icon="AddButtonIcon" @click="newTokenDialog = true">新建令牌</t-button><t-button theme="primary" :icon="LockButtonIcon" @click="go('/publish')">发布对账</t-button></div>
         </header>
 
         <section v-if="route.path === '/'" class="token-workspace">
@@ -228,27 +213,7 @@ function publish() {
           </div>
         </section>
 
-        <section v-else class="publish-page">
-          <div class="panel publish-main">
-            <div class="panel-head"><div><strong>发布准备</strong><span>生成只读版本，支持回滚到历史基线</span></div><t-tag :theme="store.locked ? 'success' : 'warning'">{{ store.locked ? '已锁定' : '候选版本' }}</t-tag></div>
-            <div class="publish-form">
-              <label><span>版本号</span><t-input v-model="selectedVersion" /></label>
-              <label><span>目标产品</span><t-select multiple value="['组件库','运营后台','移动端组件']" :options="[{label:'组件库',value:'组件库'},{label:'运营后台',value:'运营后台'},{label:'移动端组件',value:'移动端组件'},{label:'数据平台',value:'数据平台'}]" /></label>
-              <label><span>发布说明</span><t-textarea value="更新语义主色、统一控件圆角，并修复暗色主题正文对比度。" :autosize="{ minRows: 3 }" /></label>
-            </div>
-            <div class="release-checks">
-              <label><t-checkbox checked /> 循环依赖检查通过</label>
-              <label><t-checkbox checked /> 无效引用检查通过</label>
-              <label><t-checkbox :checked="store.contrastIssues.length === 0" /> 颜色对比度符合 WCAG AA</label>
-              <label><t-checkbox :checked="store.changes.every(c => c.status !== '待评审')" /> 所有变更请求已处理</label>
-            </div>
-            <div class="publish-actions"><t-button variant="outline" @click="store.rollback">回滚全部未发布编辑</t-button><t-button theme="primary" icon="lock-on" :disabled="store.locked || store.changes.some(c => c.status === '待评审')" @click="publish">校验并锁定发布</t-button></div>
-          </div>
-          <aside class="publish-side">
-            <div class="panel diff-panel"><div class="panel-head"><div><strong>版本差异</strong><span>相对 {{ store.lastPublished }}</span></div><t-tag>{{ store.diffRows.length }} 项</t-tag></div><div v-for="row in store.diffRows" :key="row.id" class="diff-row"><strong>{{ row.name }}</strong><span>{{ row.id }}</span><div><del>{{ row.before }}</del><ins>{{ row.after }}</ins></div></div><p v-if="!store.diffRows.length" class="empty">暂无未发布差异。</p></div>
-            <div class="panel history-panel"><div class="panel-head"><div><strong>发布历史</strong><span>可追溯版本</span></div><HistoryIcon /></div><div class="history-row"><t-tag theme="success" variant="light">当前</t-tag><div><strong>DS {{ store.lastPublished }}</strong><span>顾清 · 09-24 17:20</span></div><t-button size="small" variant="text">查看</t-button></div><div class="history-row"><t-tag>历史</t-tag><div><strong>DS 4.5.1</strong><span>周序 · 09-12 11:04</span></div><t-button size="small" variant="text">回滚</t-button></div><div class="history-row"><t-tag>历史</t-tag><div><strong>DS 4.5.0</strong><span>顾清 · 08-28 15:42</span></div><t-button size="small" variant="text">回滚</t-button></div></div>
-          </aside>
-        </section>
+        <PublishReconcile v-else />
       </t-content>
     </t-layout>
   </t-layout>
@@ -256,5 +221,4 @@ function publish() {
   <t-dialog v-model:visible="newTokenDialog" header="创建候选令牌" :confirm-btn="{ content: '创建', onClick: addToken }">
     <div class="dialog-form"><t-input v-model="newToken.id" label="令牌 ID" placeholder="product.component.property" /><t-input v-model="newToken.name" label="显示名称" /><t-select v-model="newToken.category" label="分类" :options="[{label:'颜色',value:'color'},{label:'字体',value:'font'},{label:'间距',value:'spacing'},{label:'圆角',value:'radius'},{label:'阴影',value:'shadow'},{label:'组件',value:'component'}]" /><t-input v-model="newToken.value" label="默认值" /><t-textarea v-model="newToken.description" label="用途说明" /></div>
   </t-dialog>
-  <t-dialog v-model:visible="releaseDialog" header="主题发布完成" :footer="false"><div class="release-success"><t-icon name="check-circle" size="46px" theme="success" /><h3>DS {{ store.releaseVersion }} 已锁定</h3><p>{{ releaseResult }}</p><p>版本快照已生成，产品使用方可以按固定版本拉取令牌。</p></div></t-dialog>
 </template>

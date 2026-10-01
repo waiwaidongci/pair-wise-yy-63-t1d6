@@ -56,8 +56,3 @@ export async function fetchTokens() {
   const response = await client.get<TokenPayload>('/api/tokens');
   return response.data;
 }
-
-export async function submitRelease(payload: { version: string; accepted: string[]; actor: string }) {
-  await new Promise((resolve) => setTimeout(resolve, 220));
-  return { accepted: true, releaseId: `DS-${payload.version}-${Date.now().toString().slice(-4)}` };
-}
